@@ -44,17 +44,20 @@ class BiometricStorageFile(
             setIsStrongBoxBacked(useStrongBox)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            if (options.authenticationValidityDurationSeconds == -1) {
-                setUserAuthenticationParameters(
-                    0,
-                    KeyProperties.AUTH_BIOMETRIC_STRONG
-                )
+            // A timeout key honours androidBiometricOnly: within the window any
+            // recent biometric authentication unlocks it, but a device credential
+            // never does. Upstream always pairs a timeout with AUTH_DEVICE_CREDENTIAL.
+            val authTypes = if (options.androidBiometricOnly) {
+                KeyProperties.AUTH_BIOMETRIC_STRONG
             } else {
-                setUserAuthenticationParameters(
-                    options.authenticationValidityDurationSeconds,
-                    KeyProperties.AUTH_DEVICE_CREDENTIAL or KeyProperties.AUTH_BIOMETRIC_STRONG
-                )
+                KeyProperties.AUTH_DEVICE_CREDENTIAL or KeyProperties.AUTH_BIOMETRIC_STRONG
             }
+            val timeout = if (options.authenticationValidityDurationSeconds == -1) {
+                0
+            } else {
+                options.authenticationValidityDurationSeconds
+            }
+            setUserAuthenticationParameters(timeout, authTypes)
         } else {
             @Suppress("DEPRECATION")
             setUserAuthenticationValidityDurationSeconds(options.authenticationValidityDurationSeconds)
