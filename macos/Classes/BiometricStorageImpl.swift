@@ -47,6 +47,15 @@ class BiometricStorageImpl {
   private let storageError: StorageError
   private let storageMethodNotImplemented: Any
 
+  /// Runs the keychain calls behind `read`, `write` and `delete`.
+  ///
+  /// On an item that needs authentication, `SecItemCopyMatching` and its
+  /// siblings do not return until the user has answered the Face ID / Touch ID
+  /// prompt. Method calls arrive on the main thread, so running them there
+  /// freezes the UI for as long as the prompt is up. Serial, so operations on
+  /// a store still happen in the order they were sent.
+  private let keychainQueue = DispatchQueue(label: "biometric_storage.keychain", qos: .userInitiated)
+
   private func storageError(code: String, message: String?, details: Any?) -> Any {
     return storageError(code, message, details)
   }
@@ -93,7 +102,9 @@ class BiometricStorageImpl {
       requiredArg("name") { name in
         requiredArg("iosPromptInfo") { promptInfo in
           requireStorage(name) { file in
-            file.read(result, IOSPromptInfo(params: promptInfo))
+            offMainThread(result) { result in
+              file.read(result, IOSPromptInfo(params: promptInfo))
+            }
           }
         }
       }
@@ -102,7 +113,9 @@ class BiometricStorageImpl {
         requiredArg("content") { content in
           requiredArg("iosPromptInfo") { promptInfo in
             requireStorage(name) { file in
-              file.write(content, result, IOSPromptInfo(params: promptInfo))
+              offMainThread(result) { result in
+                file.write(content, result, IOSPromptInfo(params: promptInfo))
+              }
             }
           }
         }
@@ -111,7 +124,9 @@ class BiometricStorageImpl {
       requiredArg("name") { name in
         requiredArg("iosPromptInfo") { promptInfo in
           requireStorage(name) { file in
-            file.delete(result, IOSPromptInfo(params: promptInfo))
+            offMainThread(result) { result in
+              file.delete(result, IOSPromptInfo(params: promptInfo))
+            }
           }
         }
       }
@@ -120,6 +135,19 @@ class BiometricStorageImpl {
     }
   }
   
+
+  /// Runs `operation` on `keychainQueue` and hands its answer back on the main
+  /// thread, where the platform channel expects it.
+  private func offMainThread(
+    _ result: @escaping StorageCallback,
+    _ operation: @escaping (@escaping StorageCallback) -> Void
+  ) {
+    keychainQueue.async {
+      operation { value in
+        DispatchQueue.main.async { result(value) }
+      }
+    }
+  }
 
   private func canAuthenticate(result: @escaping StorageCallback) {
     var error: NSError?
