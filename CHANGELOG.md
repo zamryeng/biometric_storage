@@ -1,3 +1,243 @@
+## 6.0.0-dev.7
+
+* android: a stored file that can no longer be decrypted — its keystore key
+  is gone, as after a backup restored onto another device, or the file is
+  corrupt or empty — reads as absent and is moved aside to `.unreadable`,
+  instead of failing every read. Reading never creates a key.
+* android: writes are synced and renamed into place, so a killed process or a
+  power loss cannot leave a corrupt file.
+
+## 6.0.0-dev.6
+
+* android: storage with `authenticationRequired: false` reads, writes and
+  deletes on the plugin's worker thread instead of the main thread, where its
+  keystore calls dropped Flutter frames.
+* android: a store with `androidAuthenticationValidityDuration` also reads and
+  writes on the worker thread while its validity window is open.
+
+## 6.0.0-dev.5
+
+* android: fix `minifyReleaseWithR8` failing in every app that ships a release
+  build. The plugin depended on `kotlin-logging`, which names every backend it
+  can bind to, so R8 walked references to `ch.qos.logback.*` classes that were
+  genuinely absent and refused to complete:
+
+      Missing class ch.qos.logback.classic.Logger (referenced from: ...)
+      Execution failed for task ':app:minifyReleaseWithR8'
+
+  Minification runs in release and nowhere else, so nothing anyone does while
+  developing reaches it — `flutter run`, `flutter test` and an emulator check
+  all build debug or profile. The first thing to hit it is an attempt to ship
+  to Play, which is the worst possible moment. Present in 6.0.0-dev.4.
+
+  Fixed by removing the dependencies, so nothing needs suppressing. If you
+  added `-dontwarn ch.qos.logback.**` to your own `proguard-rules.pro` to get
+  6.0.0-dev.4 to build, you can drop it.
+* android: the plugin's logging now actually produces output. `slf4j-api` and
+  `kotlin-logging` are both facades and neither had a provider, so SLF4J
+  reported `No SLF4J providers were found` once and discarded every call after
+  that. Unless a consuming app happened to ship a binding of its own, this
+  package has logged nothing at all on Android. It now writes to
+  `android.util.Log` under the tag `BiometricStorage`, and both dependencies
+  are dropped.
+
+  Debug builds log everything. Release builds stay silent until asked:
+
+      adb shell setprop log.tag.BiometricStorage VERBOSE
+* android: `BiometricStorageLogging` lets an app choose the level and the
+  destination. `level` overrides the default above — set it to `Log.VERBOSE` to
+  keep verbose logging in a release build without depending on a device
+  property. `sink` hands every record to your own logging framework instead of
+  `android.util.Log`, with the `Throwable` passed separately rather than
+  flattened into the message, so you can report the real exception:
+
+      BiometricStorageLogging.sink =
+          BiometricStorageLogging.Sink { priority, tag, message, throwable ->
+              // forward to slf4j, Timber, a file appender, a crash reporter
+          }
+
+  Installing a sink turns every level on unless `level` says otherwise. Both
+  are optional and the default is unchanged. See the README for the full
+  slf4j example.
+
+## 6.0.0-dev.4
+
+* `BiometricStorageException` carries a `code`. It previously held only a
+  message, so telling "you called `getStorage` twice" from "the credential store
+  failed" meant matching English text — and 6.0.0-dev.2 took the number of
+  places it is raised from one to six. `BiometricStorageExceptionCode` is
+  `alreadyInitialized`, `storageFailure` or `unknown`, and every site that
+  raises `BiometricStorageException` classifies itself, including the
+  `AlreadyInitialized` the method-channel platforms raise. Additive: the
+  positional constructor is unchanged and defaults to `unknown`, so existing
+  `catch` blocks keep working. Switch over it with a `default` — members may be
+  added in a minor release.
+
+  Note the boundary: `storageFailure` today reaches only Windows. A failing
+  keychain, keystore or libsecret still surfaces as a raw `PlatformException`
+  (`SecurityError`, `Unexpected Error` and `Security Access Error` among
+  others), because those are not translated. So a single cross-platform "the store failed" branch is
+  not yet writable; that is a later change.
+* `AuthExceptionCode` is documented as an open enum, matching the above. No
+  behaviour change — but it means the members that Android currently collapses
+  into `unknown`, lockout among them, can be split out in a minor release rather
+  than waiting for 7.0.
+
+## 6.0.0-dev.3
+
+* linux: fix a memory leak on every method call.
+  `fl_method_success_response_new` takes its own reference to the `FlValue`
+  rather than adopting the caller's, so the inline
+  `fl_method_success_response_new(fl_value_new_*(…))` form leaked one value per
+  call. Present since the Linux implementation landed in 3.0.0. The worst of the six is
+  `read()`, which leaked a **plaintext-secret-bearing allocation on every
+  successful read** — so a long-running app both grew without bound and kept
+  copies of every secret it had read alive in the process.
+* **Breaking**: linux honours `forceInit`, closing the gap 6.0.0-dev.2 documented.
+  It throws `AlreadyInitialized`, which the Dart layer already translates to
+  `BiometricStorageException`, so the exception is the same one every other
+  platform raises. A repeat `getStorage()` without the flag now reports `false`
+  rather than `true` — libsecret keeps no handle, so the names handed out during
+  a run are tracked by the plugin instance and reset when it is disposed.
+
+## 6.0.0-dev.2
+
+Six pre-existing bugs, all found while reviewing 6.0.0-dev.1 and none introduced
+by it.
+
+* android: an authentication requested while the activity cannot host a dialog
+  no longer hangs forever. `androidx.biometric` refuses to start after
+  `onSaveInstanceState` — logging `Unable to start authentication` — and returns
+  without invoking any callback, so the pending Flutter result never completed.
+  The state is checked up front and reported as
+  `AuthException(AuthExceptionCode.unknown)` instead. Reachable whenever the app
+  is backgrounded, independently of the configuration-change bug below.
+* android: the plugin kept using a destroyed `Activity` after a configuration
+  change. `onReattachedToActivityForConfigChanges` and
+  `onDetachedFromActivityForConfigChanges` were both empty, so after a rotation
+  every authenticated read or write handed `BiometricPrompt` a dead
+  `FragmentActivity`. `ActivityAware` documents that the old reference must be
+  cleared and the new binding adopted; now both happen.
+* android: a storage-not-initialized error delivered its message as the
+  `PlatformException.code` — the field callers match on. The code is now
+  `NotInitialized`.
+* iOS/macOS: `init` replied twice when an argument was missing or mistyped, so
+  the caller saw the error and then a success. The success reply now only
+  happens on the success path.
+* **Breaking**: iOS/macOS `canAuthenticate()` reports an unrecognised `LAError`
+  as `CanAuthenticateResponse.statusUnknown` rather than `unsupported`, matching
+  Android. `unsupported` means "the plugin does not support this platform", so a
+  recoverable `biometryLockout` was telling callers to give up entirely. Callers
+  that treat `statusUnknown` as usable will now attempt authentication where
+  they previously did not.
+* **Breaking**: iOS/macOS, a repeat `getStorage()` for a name that is already
+  open no longer rebuilds the store. It used to replace it outright, which threw
+  away the cached `LAContext` — so any
+  `darwinTouchIDAuthenticationForceReuseContextDuration` in progress — and
+  quietly adopted whatever options the second call passed. The first call now
+  wins, as on Android. If you relied on re-initializing to change options, give
+  each set of options its own store name, or restart — there is no API to close
+  a store, so none can be reopened differently within a run. Passing different
+  options to a repeat call was never reported back to Dart, and now definitively
+  does nothing.
+* **Breaking**: `forceInit` now does what it documents on Windows, web, iOS and
+  macOS. It was implemented on Android only; the others accepted the flag and
+  dropped it. It throws `BiometricStorageException` on every platform — the
+  `PlatformException(code: 'AlreadyInitialized')` that the method-channel
+  platforms raise is translated, so one catch clause covers all of them.
+  **Linux still ignores the flag**: its `init` keeps no per-store state at all,
+  so implementing it there is a separate change.
+* **Breaking**: windows `read()` and `delete()` throw `BiometricStorageException`
+  when the credential store fails, instead of returning `null` and `false`.
+  Those values still mean "no value stored" and "there was nothing to delete" —
+  previously they doubled as the answer for a failing store, so a failure read
+  as data loss.
+* iOS/macOS: `canAuthenticate()` names `biometryLockout` explicitly rather than
+  letting it fall through the unmapped-code path, and the nil-error branch
+  reports `statusUnknown` too rather than `unsupported`.
+
+## 6.0.0-dev.1
+
+**Breaking**: requires Dart 3.10 / Flutter 3.44 or newer.
+
+* Support `package:win32` 6.x, and drop 5.x and older. Every 5.x release of this
+  plugin pinned `win32 >=2.0.0 <6.0.0`, which made it unresolvable alongside
+  `package_info_plus >=10.1.0` and anything else on win32 6. The Windows
+  implementation is compiled on every `dart.library.io` platform, so win32 6
+  removing `TEXT()` also broke iOS and macOS builds — the test suite now imports
+  the public barrel so `flutter test` compiles the win32 bindings on any host.
+* windows: writing an empty value no longer throws.
+* windows: fix a use-after-free in `read()`. `CredentialBlob.asTypedList()` is a
+  view onto memory owned by the credential, and it was decoded *after* `CredFree`
+  had released it. The bytes are now copied out first. Present since 1.1.0,
+  where a9e3944 moved the `CredFree` call in between the two.
+* windows: the bindings now have runtime coverage, not just compile coverage —
+  `test/biometric_storage_win32_test.dart` exercises write/read/delete against
+  the real credential store, and runs on the Windows CI job.
+* iOS/macOS: Swift Package Manager support. Adding this plugin to an app that has
+  migrated to SwiftPM no longer regenerates a `Podfile`. CocoaPods keeps working;
+  both a `Package.swift` and a podspec are shipped.
+* iOS/macOS: the Swift sources moved to `darwin/` and are shared through
+  `sharedDarwinSource`, replacing the symlink from `ios/Classes`. The macOS
+  plugin class is now `BiometricStoragePlugin` (was
+  `BiometricStorageMacOSPlugin`) and the Objective-C shim on iOS is gone. Neither
+  is referenced from Dart, so this is only visible in a hand-written registrant.
+* android: AGP 8.13, Kotlin 2.2, compileSdk 36, `androidx.biometric`
+  1.4.0-alpha05, `core-ktx` 1.18.0, `fragment-ktx` 1.9.0, slf4j 2.0.18 and
+  kotlin-logging 8. The plugin no longer applies the Kotlin Gradle Plugin itself
+  — AGP 9 warns about that and future Flutter releases reject it.
+* android: `canAuthenticate()` no longer throws on a status code the plugin does
+  not know about — Android 16 added `BIOMETRIC_ERROR_NOT_ENABLED_FOR_APPS` (21)
+  and every call blew up. Unmapped codes are reported as
+  `CanAuthenticateResponse.statusUnknown` and logged.
+  https://github.com/authpass/biometric_storage/issues/148
+* android: the plugin no longer calls `jvmToolchain`, which failed to resolve in
+  some consumer builds. https://github.com/authpass/biometric_storage/issues/107
+* Document the Android `FlutterFragmentActivity` and `Theme.AppCompat`
+  requirements as what they actually are: both only apply to storage that shows
+  an authentication prompt, and the theme only where `androidx.biometric` falls
+  back to its own dialog, which is below API 28 rather than below API 29.
+* web: the package is now WebAssembly-ready. `lib/src/biometric_storage.dart`
+  imported `dart:io` unconditionally for `Platform`, which marked the whole
+  package wasm-incompatible; the host OS now comes through a conditional import,
+  with `dart:io` still doing the work everywhere it exists. No behaviour change
+  on any platform. https://github.com/authpass/biometric_storage/issues/145
+* iOS/macOS: the prompt strings (`IosPromptInfo.saveTitle` / `accessTitle`) now
+  travel on the `LAContext` as `localizedReason` instead of through
+  `kSecUseOperationPrompt`, deprecated since iOS 14 / macOS 11. Same prompts, no
+  deprecation warnings on build.
+
+## 5.2.0-dev.1
+
+* iOS/macOS: `StorageFileInitOptions.darwinKeychainAccessGroup` to store items
+  in a shared keychain access group (`kSecAttrAccessGroup`), so an app
+  extension can read them. Note that the access group is part of an item's
+  identity — existing items are not migrated automatically.
+
+## 5.1.1-dev.2
+
+* Improve `canAuthenticate` to include `InitOptions` to decide for which authenticaiton type to check.
+
+## 5.1.0
+
+* Fix typo in Flutter to iOS reuse duration parameter name @jefmathiot #125
+
+## 5.1.0-rc.5
+
+* upgrade dependency to web 1.0
+
+## 5.1.0-rc.4
+
+* enable building on jdk 17 and up https://github.com/authpass/biometric_storage/issues/117 thanks @connyduck
+
+## 5.1.0-rc.3
+
+* Split Split authenticationValidityDurationSeconds between android and iOS
+  * `darwinTouchIDAuthenticationForceReuseContextDuration`: Basically the equivalent to `androidAuthenticationValidityDuration`
+  * `darwinTouchIDAuthenticationAllowableReuseDuration`
+* android: return correct code if no biometric is enrolled #115 @ThomasLamprecht
+* web: migrate from dart:html to package:web (for wasm support).
+
 ## 5.0.1
 
 * Add option for iOS/MacOS to allow non-biometric authentication (`darwinBiometricOnly`) #101

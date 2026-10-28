@@ -14,13 +14,19 @@ struct StorageMethodCall {
 
 class InitOptions {
   init(params: [String: Any]) {
-    authenticationValidityDurationSeconds = params["authenticationValidityDurationSeconds"] as? Int
+    darwinTouchIDAuthenticationAllowableReuseDuration = params["darwinTouchIDAuthenticationAllowableReuseDurationSeconds"] as? Int
+    darwinTouchIDAuthenticationForceReuseContextDuration = params["darwinTouchIDAuthenticationForceReuseContextDurationSeconds"] as? Int
     authenticationRequired = params["authenticationRequired"] as? Bool
     darwinBiometricOnly = params["darwinBiometricOnly"] as? Bool
+    darwinKeychainAccessGroup = params["darwinKeychainAccessGroup"] as? String
   }
-  let authenticationValidityDurationSeconds: Int!
+  let darwinTouchIDAuthenticationAllowableReuseDuration: Int?
+  let darwinTouchIDAuthenticationForceReuseContextDuration: Int?
   let authenticationRequired: Bool!
   let darwinBiometricOnly: Bool!
+  /// kSecAttrAccessGroup, so an app extension of the same app can read the
+  /// item. Part of the item's identity — see the dart side for the caveats.
+  let darwinKeychainAccessGroup: String?
 }
 
 class IOSPromptInfo {
@@ -78,14 +84,37 @@ class BiometricStorageImpl {
     }
     
     if ("canAuthenticate" == call.method) {
-      canAuthenticate(result: result)
+      requiredArg("options") { options in
+        let initOptions = InitOptions(params: options)
+        canAuthenticate(options: initOptions, result: result)
+      }
     } else if ("init" == call.method) {
-      requiredArg("name") { name in
-        requiredArg("options") { options in
+      requiredArg("name") { (name: String) in
+        requiredArg("options") { (options: [String: Any]) in
+          // The success reply belongs on the success path. It used to sit after
+          // this block and ran unconditionally, so a missing or mistyped
+          // argument replied with the error and then replied `true` as well —
+          // Flutter discards the second reply and logs "Reply already
+          // submitted", leaving the caller believing init had succeeded.
+          if stores[name] != nil {
+            // Mirrors Android: forceInit means "assert this was not already
+            // initialised", and without it a repeat init is a no-op reporting
+            // false. Neither was implemented here at all before.
+            let args = call.arguments as? [String: Any]
+            if args?["forceInit"] as? Bool == true {
+              result(storageError(
+                code: "AlreadyInitialized",
+                message: "A storage file with the name '\(name)' was already initialized.",
+                details: nil))
+            } else {
+              result(false)
+            }
+            return
+          }
           stores[name] = BiometricStorageFile(name: name, initOptions: InitOptions(params: options), storageError: storageError)
+          result(true)
         }
       }
-      result(true)
     } else if ("dispose" == call.method) {
       // nothing to dispose
       result(true)
@@ -121,15 +150,18 @@ class BiometricStorageImpl {
   }
   
 
-  private func canAuthenticate(result: @escaping StorageCallback) {
+  private func canAuthenticate(options: InitOptions, result: @escaping StorageCallback) {
     var error: NSError?
     let context = LAContext()
-    if context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &error) {
+    let policy: LAPolicy = options.darwinBiometricOnly ? .deviceOwnerAuthenticationWithBiometrics : .deviceOwnerAuthentication
+    if context.canEvaluatePolicy(policy, error: &error) {
       result("Success")
       return
     }
     guard let err = error else {
-      result("ErrorUnknown")
+      // Same reasoning as the default arm below: "cannot tell" is not
+      // "this plugin does not work on this platform".
+      result("ErrorStatusUnknown")
       return
     }
     let laError = LAError(_nsError: err)
@@ -144,31 +176,84 @@ class BiometricStorageImpl {
     case .touchIDNotEnrolled:
       result("ErrorNoBiometricEnrolled")
       break;
+    case .biometryLockout:
+      // Recoverable — too many failed attempts, and the user can retry later or
+      // fall back to the device credential. Named explicitly rather than left
+      // to the default arm so that the "unmapped" log there keeps meaning
+      // "something we have not seen", instead of firing on the common case.
+      // androidx's BiometricManager has no lockout status at all, so Android
+      // callers already get Success here and discover the lockout at the
+      // prompt; reporting "cannot tell, try it" converges the two platforms.
+      result("ErrorStatusUnknown")
+      break;
     case .invalidContext: fallthrough
     default:
-      result("ErrorUnknown")
+      // Not "ErrorUnknown": the Dart side maps that to
+      // CanAuthenticateResponse.unsupported, whose own doc reads "Plugin does
+      // not support platform", so a biometryLockout — too many failed attempts,
+      // and recoverable — told callers the plugin did not work on iOS at all.
+      // ErrorStatusUnknown is what Android reports for a code it does not
+      // recognise, and it says what is actually true: we cannot tell.
+      NSLog("Unmapped LAError \(laError.code.rawValue), reporting status unknown");
+      result("ErrorStatusUnknown")
       break;
     }
   }
 }
 
+typealias StoredContext = (context: LAContext, expireAt: Date)
+
 class BiometricStorageFile {
   private let name: String
   private let initOptions: InitOptions
-  private var context: LAContext { get {
-    let context = LAContext()
-    if (initOptions.authenticationRequired) {
-      if initOptions.authenticationValidityDurationSeconds > 0 {
-        if #available(OSX 10.12, *) {
-          context.touchIDAuthenticationAllowableReuseDuration = Double(initOptions.authenticationValidityDurationSeconds)
+  private var _context: StoredContext?
+  private var context: LAContext {
+    get {
+      if let context = _context {
+        if context.expireAt.timeIntervalSinceNow < 0 {
+          // already expired.
+          _context = nil
         } else {
-          // Fallback on earlier versions
-          hpdebug("Pre OSX 10.12 no touchIDAuthenticationAllowableReuseDuration available. ignoring.")
+          return context.context
         }
       }
+      
+      let context = LAContext()
+      if (initOptions.authenticationRequired) {
+        if let duration = initOptions.darwinTouchIDAuthenticationAllowableReuseDuration {
+          if #available(OSX 10.12, *) {
+            context.touchIDAuthenticationAllowableReuseDuration = Double(duration)
+          } else {
+            // Fallback on earlier versions
+            hpdebug("Pre OSX 10.12 no touchIDAuthenticationAllowableReuseDuration available. ignoring.")
+          }
+        }
+        
+        if let duration = initOptions.darwinTouchIDAuthenticationForceReuseContextDuration {
+          _context = (context: context, expireAt: Date(timeIntervalSinceNow: Double(duration)))
+        }
+      }
+      return context
     }
+  }
+
+  /// The authentication context to hand to a keychain query, carrying the reason
+  /// the prompt should give for itself.
+  ///
+  /// This replaces `kSecUseOperationPrompt`, deprecated since iOS 14 / macOS 11:
+  /// the reason now travels on the context rather than in the query. It is set
+  /// on every call because `context` may return a context reused across calls.
+  private func authenticationContext(reason: String?) -> LAContext {
+    let context = self.context
+    // Assigned unconditionally, including when empty. `context` may be one
+    // reused across calls when darwinTouchIDAuthenticationForceReuseContextDuration
+    // is set, so skipping the assignment would leave the *previous* call's
+    // reason in place — a read showing the save prompt's wording. The query key
+    // this replaced was per-query and could not carry over like that.
+    context.localizedReason = reason ?? ""
     return context
-  } }
+  }
+
   private let storageError: StorageError
 
   init(name: String, initOptions: InitOptions, storageError: @escaping StorageError) {
@@ -183,6 +268,12 @@ class BiometricStorageFile {
       kSecAttrService as String: "flutter_biometric_storage",
       kSecAttrAccount as String: name,
     ] as [String : Any]
+    if let accessGroup = initOptions.darwinKeychainAccessGroup {
+      // Has to be on every query, not just the write: the access group is part
+      // of an item's identity, so a read without it will not find an item
+      // written with it.
+      query[kSecAttrAccessGroup as String] = accessGroup
+    }
     if initOptions.authenticationRequired {
       guard let access = accessControl(result) else {
         return nil
@@ -232,10 +323,10 @@ class BiometricStorageFile {
       return;
     }
     query[kSecMatchLimit as String] = kSecMatchLimitOne
-    query[kSecUseOperationPrompt as String] = promptInfo.accessTitle
     query[kSecReturnAttributes as String] = true
     query[kSecReturnData as String] = true
-    query[kSecUseAuthenticationContext as String] = context
+    query[kSecUseAuthenticationContext as String] =
+      authenticationContext(reason: promptInfo.accessTitle)
     
     var item: CFTypeRef?
     
@@ -284,11 +375,9 @@ class BiometricStorageFile {
 
     if (initOptions.authenticationRequired) {
       query.merge([
-        kSecUseAuthenticationContext as String: context,
+        kSecUseAuthenticationContext as String:
+          authenticationContext(reason: promptInfo.saveTitle),
       ]) { (_, new) in new }
-      if let operationPrompt = promptInfo.saveTitle {
-        query[kSecUseOperationPrompt as String] = operationPrompt
-      }
     } else {
       hpdebug("No authentication required for \(name)")
     }
